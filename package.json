@@ -1,0 +1,37 @@
+{
+  "name": "heirlock",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Non-custodial inheritance vaults for Ethereum",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "test": "npm run test --workspace=packages/contracts",
+    "test:coverage": "npm run test:coverage --workspace=packages/contracts",
+    "compile": "npm run compile --workspace=packages/contracts",
+    "deploy:local": "npm run deploy:local --workspace=packages/contracts",
+    "deploy:sepolia": "npm run deploy:sepolia --workspace=packages/contracts",
+    "deploy:mainnet": "npm run deploy:mainnet --workspace=packages/contracts",
+    "deploy:polygon": "npm run deploy:polygon --workspace=packages/contracts",
+    "deploy:arbitrum": "npm run deploy:arbitrum --workspace=packages/contracts",
+    "deploy:base": "npm run deploy:base --workspace=packages/contracts",
+    "node": "npm run node --workspace=packages/contracts",
+    "clean": "npm run clean --workspaces --if-present"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yourusername/heirlock.git"
+  },
+  "keywords": [
+    "ethereum",
+    "inheritance",
+    "smart-contracts",
+    "defi",
+    "web3"
+  ],
+  "author": "Heirlock",
+  "license": "MIT"
+}
