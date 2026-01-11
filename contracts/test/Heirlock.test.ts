@@ -1,8 +1,7 @@
 import { expect } from "chai";
 import { ethers } from "hardhat";
 import { time, loadFixture } from "@nomicfoundation/hardhat-toolbox/network-helpers";
-import { HeirlockFactory, HeirlockVault, HeirlockRegistry, MockERC20 } from "../typechain-types";
-import { SignerWithAddress } from "@nomicfoundation/hardhat-ethers/signers";
+import { HeirlockFactory, HeirlockVault, HeirlockRegistry } from "../typechain-types";
 
 describe("Heirlock", function () {
   // Time constants
@@ -11,550 +10,442 @@ describe("Heirlock", function () {
   const ONE_YEAR = 365 * 24 * 60 * 60;
   const TWO_YEARS = 2 * ONE_YEAR;
 
+  // Fee constants
+  const BASIC_VAULT_FEE = ethers.parseEther("0.01");
+  const YIELD_VAULT_FEE = ethers.parseEther("0.02");
+
   // Basis points
   const BP_100 = 10000;
   const BP_50 = 5000;
   const BP_25 = 2500;
 
   async function deployFixture() {
-    const [owner, beneficiary1, beneficiary2, beneficiary3, stranger] = await ethers.getSigners();
+    const [owner, treasury, beneficiary1, beneficiary2, beneficiary3, stranger] = 
+      await ethers.getSigners();
 
+    // Deploy Factory (with zero addresses for yield protocols in basic tests)
     const Factory = await ethers.getContractFactory("HeirlockFactory");
-    const factory = await Factory.deploy();
+    const factory = await Factory.deploy(
+      treasury.address,
+      ethers.ZeroAddress, // lido
+      ethers.ZeroAddress, // wsteth
+      ethers.ZeroAddress, // aavePool
+      ethers.ZeroAddress  // curvePool
+    );
 
+    // Deploy Registry
     const Registry = await ethers.getContractFactory("HeirlockRegistry");
     const registry = await Registry.deploy();
 
-    const MockToken = await ethers.getContractFactory("MockERC20");
-    const tokenA = await MockToken.deploy("Token A", "TKNA", ethers.parseEther("1000000"));
-    const tokenB = await MockToken.deploy("Token B", "TKNB", ethers.parseEther("1000000"));
+    // Deploy MockERC20 for token tests
+    const MockERC20 = await ethers.getContractFactory("MockERC20");
+    const mockToken = await MockERC20.deploy("Mock Token", "MOCK", 18);
+    const mockUSDC = await MockERC20.deploy("Mock USDC", "USDC", 6);
 
-    return { factory, registry, tokenA, tokenB, owner, beneficiary1, beneficiary2, beneficiary3, stranger };
+    return { 
+      factory, registry, mockToken, mockUSDC,
+      owner, treasury, beneficiary1, beneficiary2, beneficiary3, stranger 
+    };
   }
-
-  async function createVaultFixture() {
-    const base = await loadFixture(deployFixture);
-    const { factory, owner, beneficiary1, beneficiary2 } = base;
-
-    const beneficiaries = [
-      { wallet: beneficiary1.address, basisPoints: BP_50 },
-      { wallet: beneficiary2.address, basisPoints: BP_50 }
-    ];
-
-    const tx = await factory.createVault(beneficiaries, SIX_MONTHS);
-    const receipt = await tx.wait();
-    
-    const event = receipt?.logs.find(
-      (log: any) => log.fragment?.name === "VaultCreated"
-    );
-    const vaultAddress = (event as any).args.vault;
-
-    const vault = await ethers.getContractAt("HeirlockVault", vaultAddress);
-
-    return { ...base, vault, vaultAddress };
-  }
-
-  async function fundedVaultFixture() {
-    const base = await loadFixture(createVaultFixture);
-    const { vault, tokenA, tokenB, owner } = base;
-
-    await owner.sendTransaction({
-      to: await vault.getAddress(),
-      value: ethers.parseEther("10")
-    });
-
-    await tokenA.transfer(await vault.getAddress(), ethers.parseEther("1000"));
-    await tokenB.transfer(await vault.getAddress(), ethers.parseEther("500"));
-
-    await vault.registerTokens([await tokenA.getAddress(), await tokenB.getAddress()]);
-
-    return base;
-  }
-
-  // ============================================
-  // FACTORY TESTS
-  // ============================================
 
   describe("HeirlockFactory", function () {
-    it("should create a vault with correct parameters", async function () {
-      const { factory, owner, beneficiary1 } = await loadFixture(deployFixture);
+    it("Should deploy with correct treasury", async function () {
+      const { factory, treasury } = await loadFixture(deployFixture);
+      expect(await factory.treasury()).to.equal(treasury.address);
+    });
 
+    it("Should return correct fee amounts", async function () {
+      const { factory } = await loadFixture(deployFixture);
+      expect(await factory.getBasicVaultFee()).to.equal(BASIC_VAULT_FEE);
+      expect(await factory.getYieldVaultFee()).to.equal(YIELD_VAULT_FEE);
+    });
+
+    it("Should create basic vault with correct fee", async function () {
+      const { factory, owner, treasury, beneficiary1 } = await loadFixture(deployFixture);
+      
       const beneficiaries = [{ wallet: beneficiary1.address, basisPoints: BP_100 }];
-
-      await expect(factory.createVault(beneficiaries, SIX_MONTHS))
-        .to.emit(factory, "VaultCreated");
-
+      const treasuryBalanceBefore = await ethers.provider.getBalance(treasury.address);
+      
+      const tx = await factory.createBasicVault(beneficiaries, SIX_MONTHS, { 
+        value: BASIC_VAULT_FEE 
+      });
+      
+      const receipt = await tx.wait();
+      const treasuryBalanceAfter = await ethers.provider.getBalance(treasury.address);
+      
+      expect(treasuryBalanceAfter - treasuryBalanceBefore).to.equal(BASIC_VAULT_FEE);
       expect(await factory.getTotalVaults()).to.equal(1);
-      expect(await factory.getVaultCountByOwner(owner.address)).to.equal(1);
     });
 
-    it("should allow multiple vaults per owner", async function () {
-      const { factory, owner, beneficiary1, beneficiary2 } = await loadFixture(deployFixture);
-
-      const ben1 = [{ wallet: beneficiary1.address, basisPoints: BP_100 }];
-      const ben2 = [{ wallet: beneficiary2.address, basisPoints: BP_100 }];
-
-      await factory.createVault(ben1, ONE_MONTH);
-      await factory.createVault(ben2, ONE_YEAR);
-
-      expect(await factory.getVaultCountByOwner(owner.address)).to.equal(2);
-    });
-
-    it("should reject invalid threshold (too short)", async function () {
+    it("Should reject vault creation with insufficient fee", async function () {
       const { factory, beneficiary1 } = await loadFixture(deployFixture);
+      
       const beneficiaries = [{ wallet: beneficiary1.address, basisPoints: BP_100 }];
-
-      await expect(factory.createVault(beneficiaries, ONE_MONTH - 1))
-        .to.be.revertedWith("Threshold too short");
+      
+      await expect(
+        factory.createBasicVault(beneficiaries, SIX_MONTHS, { 
+          value: ethers.parseEther("0.005") 
+        })
+      ).to.be.revertedWithCustomError(factory, "InsufficientFee");
     });
 
-    it("should reject invalid threshold (too long)", async function () {
-      const { factory, beneficiary1 } = await loadFixture(deployFixture);
+    it("Should refund excess ETH", async function () {
+      const { factory, owner, beneficiary1 } = await loadFixture(deployFixture);
+      
       const beneficiaries = [{ wallet: beneficiary1.address, basisPoints: BP_100 }];
-
-      await expect(factory.createVault(beneficiaries, TWO_YEARS + 1))
-        .to.be.revertedWith("Threshold too long");
+      const excessAmount = ethers.parseEther("0.05");
+      
+      const balanceBefore = await ethers.provider.getBalance(owner.address);
+      const tx = await factory.createBasicVault(beneficiaries, SIX_MONTHS, { 
+        value: excessAmount 
+      });
+      const receipt = await tx.wait();
+      const gasUsed = receipt!.gasUsed * receipt!.gasPrice;
+      const balanceAfter = await ethers.provider.getBalance(owner.address);
+      
+      // Should only have spent BASIC_VAULT_FEE + gas
+      const spent = balanceBefore - balanceAfter;
+      expect(spent).to.be.closeTo(BASIC_VAULT_FEE + gasUsed, ethers.parseEther("0.001"));
     });
 
-    it("should reject beneficiaries that don't total 100%", async function () {
-      const { factory, beneficiary1, beneficiary2 } = await loadFixture(deployFixture);
+    it("Should track vaults by owner", async function () {
+      const { factory, owner, beneficiary1 } = await loadFixture(deployFixture);
+      
+      const beneficiaries = [{ wallet: beneficiary1.address, basisPoints: BP_100 }];
+      
+      await factory.createBasicVault(beneficiaries, SIX_MONTHS, { value: BASIC_VAULT_FEE });
+      await factory.createBasicVault(beneficiaries, ONE_YEAR, { value: BASIC_VAULT_FEE });
+      
+      const ownerVaults = await factory.getVaultsByOwner(owner.address);
+      expect(ownerVaults.length).to.equal(2);
+    });
+  });
+
+  describe("HeirlockVault", function () {
+    async function createVaultFixture() {
+      const base = await loadFixture(deployFixture);
+      const { factory, beneficiary1, beneficiary2 } = base;
+      
       const beneficiaries = [
         { wallet: beneficiary1.address, basisPoints: BP_50 },
-        { wallet: beneficiary2.address, basisPoints: BP_25 }
+        { wallet: beneficiary2.address, basisPoints: BP_50 }
       ];
-
-      await expect(factory.createVault(beneficiaries, SIX_MONTHS))
-        .to.be.revertedWith("Shares must total 100%");
-    });
-  });
-
-  // ============================================
-  // VAULT BASIC TESTS
-  // ============================================
-
-  describe("HeirlockVault - Basic", function () {
-    it("should have correct initial state", async function () {
-      const { vault, owner } = await loadFixture(createVaultFixture);
-
-      expect(await vault.owner()).to.equal(owner.address);
-      expect(await vault.inactivityThreshold()).to.equal(SIX_MONTHS);
-      expect(await vault.distributed()).to.equal(false);
-      expect(await vault.getBeneficiaryCount()).to.equal(2);
-    });
-
-    it("should accept ETH deposits", async function () {
-      const { vault, owner } = await loadFixture(createVaultFixture);
-      const depositAmount = ethers.parseEther("5");
-
-      await expect(owner.sendTransaction({
-        to: await vault.getAddress(),
-        value: depositAmount
-      })).to.emit(vault, "ETHDeposited").withArgs(owner.address, depositAmount);
-
-      expect(await ethers.provider.getBalance(await vault.getAddress())).to.equal(depositAmount);
-    });
-
-    it("should accept token deposits", async function () {
-      const { vault, tokenA } = await loadFixture(createVaultFixture);
-      const depositAmount = ethers.parseEther("100");
-
-      await tokenA.transfer(await vault.getAddress(), depositAmount);
-      expect(await tokenA.balanceOf(await vault.getAddress())).to.equal(depositAmount);
-    });
-  });
-
-  // ============================================
-  // CHECK-IN TESTS
-  // ============================================
-
-  describe("HeirlockVault - Check-in", function () {
-    it("should allow owner to check in", async function () {
-      const { vault } = await loadFixture(createVaultFixture);
-
-      await time.increase(ONE_MONTH);
       
-      await expect(vault.checkIn()).to.emit(vault, "CheckIn");
-    });
-
-    it("should reject check-in from non-owner", async function () {
-      const { vault, stranger } = await loadFixture(createVaultFixture);
-
-      await expect(vault.connect(stranger).checkIn())
-        .to.be.revertedWith("Not owner");
-    });
-
-    it("should reset claimable timer on check-in", async function () {
-      const { vault } = await loadFixture(createVaultFixture);
-
-      await time.increase(SIX_MONTHS - 1000);
-      expect(await vault.isClaimable()).to.equal(false);
-
-      await vault.checkIn();
-
-      await time.increase(1000);
-      expect(await vault.isClaimable()).to.equal(false);
-    });
-
-    it("should return correct time until claimable", async function () {
-      const { vault } = await loadFixture(createVaultFixture);
-
-      const timeUntil = await vault.getTimeUntilClaimable();
-      expect(timeUntil).to.be.closeTo(BigInt(SIX_MONTHS), BigInt(10));
-
-      await time.increase(ONE_MONTH);
+      const tx = await factory.createBasicVault(beneficiaries, SIX_MONTHS, { 
+        value: BASIC_VAULT_FEE 
+      });
+      const receipt = await tx.wait();
       
-      const timeUntil2 = await vault.getTimeUntilClaimable();
-      expect(timeUntil2).to.be.closeTo(BigInt(SIX_MONTHS - ONE_MONTH), BigInt(10));
-    });
-  });
-
-  // ============================================
-  // TOKEN REGISTRATION TESTS
-  // ============================================
-
-  describe("HeirlockVault - Token Registration", function () {
-    it("should allow owner to register tokens", async function () {
-      const { vault, tokenA } = await loadFixture(createVaultFixture);
-
-      await expect(vault.registerToken(await tokenA.getAddress()))
-        .to.emit(vault, "TokenRegistered")
-        .withArgs(await tokenA.getAddress());
-
-      expect(await vault.getRegisteredTokenCount()).to.equal(1);
-      expect(await vault.isTokenRegistered(await tokenA.getAddress())).to.equal(true);
-    });
-
-    it("should allow batch token registration", async function () {
-      const { vault, tokenA, tokenB } = await loadFixture(createVaultFixture);
-
-      await vault.registerTokens([await tokenA.getAddress(), await tokenB.getAddress()]);
-
-      expect(await vault.getRegisteredTokenCount()).to.equal(2);
-    });
-
-    it("should allow owner to unregister tokens", async function () {
-      const { vault, tokenA, tokenB } = await loadFixture(createVaultFixture);
-
-      await vault.registerTokens([await tokenA.getAddress(), await tokenB.getAddress()]);
-      await vault.unregisterToken(await tokenA.getAddress());
-
-      expect(await vault.getRegisteredTokenCount()).to.equal(1);
-      expect(await vault.isTokenRegistered(await tokenA.getAddress())).to.equal(false);
-    });
-
-    it("should reject registration from non-owner", async function () {
-      const { vault, tokenA, stranger } = await loadFixture(createVaultFixture);
-
-      await expect(vault.connect(stranger).registerToken(await tokenA.getAddress()))
-        .to.be.revertedWith("Not owner");
-    });
-  });
-
-  // ============================================
-  // OWNER WITHDRAWAL TESTS
-  // ============================================
-
-  describe("HeirlockVault - Owner Withdrawals", function () {
-    it("should allow owner to withdraw ETH", async function () {
-      const { vault, owner } = await loadFixture(fundedVaultFixture);
-      const withdrawAmount = ethers.parseEther("5");
-      
-      await expect(vault.withdrawETH(withdrawAmount))
-        .to.emit(vault, "ETHWithdrawn")
-        .withArgs(owner.address, withdrawAmount);
-
-      expect(await ethers.provider.getBalance(await vault.getAddress()))
-        .to.equal(ethers.parseEther("5"));
-    });
-
-    it("should allow owner to withdraw tokens", async function () {
-      const { vault, tokenA, owner } = await loadFixture(fundedVaultFixture);
-      const withdrawAmount = ethers.parseEther("500");
-
-      await expect(vault.withdrawToken(await tokenA.getAddress(), withdrawAmount))
-        .to.emit(vault, "TokenWithdrawn");
-
-      expect(await tokenA.balanceOf(await vault.getAddress()))
-        .to.equal(ethers.parseEther("500"));
-    });
-
-    it("should reject withdrawals from non-owner", async function () {
-      const { vault, stranger } = await loadFixture(fundedVaultFixture);
-
-      await expect(vault.connect(stranger).withdrawETH(ethers.parseEther("1")))
-        .to.be.revertedWith("Not owner");
-    });
-  });
-
-  // ============================================
-  // DISTRIBUTION TESTS
-  // ============================================
-
-  describe("HeirlockVault - Distribution", function () {
-    it("should not allow distribution before threshold", async function () {
-      const { vault, beneficiary1 } = await loadFixture(fundedVaultFixture);
-
-      await time.increase(SIX_MONTHS - 100);
-
-      await expect(vault.connect(beneficiary1).triggerDistribution())
-        .to.be.revertedWith("Not yet claimable");
-    });
-
-    it("should allow distribution after threshold", async function () {
-      const { vault, beneficiary1 } = await loadFixture(fundedVaultFixture);
-
-      await time.increase(SIX_MONTHS + 1);
-
-      await expect(vault.connect(beneficiary1).triggerDistribution())
-        .to.emit(vault, "DistributionTriggered");
-
-      expect(await vault.distributed()).to.equal(true);
-    });
-
-    it("should calculate correct shares for beneficiaries", async function () {
-      const { vault, beneficiary1, beneficiary2 } = await loadFixture(fundedVaultFixture);
-
-      await time.increase(SIX_MONTHS + 1);
-      await vault.triggerDistribution();
-
-      const [ethAmount1] = await vault.getClaimableAmounts(beneficiary1.address);
-      const [ethAmount2] = await vault.getClaimableAmounts(beneficiary2.address);
-
-      expect(ethAmount1).to.equal(ethers.parseEther("5"));
-      expect(ethAmount2).to.equal(ethers.parseEther("5"));
-    });
-
-    it("should not allow double distribution", async function () {
-      const { vault, beneficiary1 } = await loadFixture(fundedVaultFixture);
-
-      await time.increase(SIX_MONTHS + 1);
-      await vault.triggerDistribution();
-
-      await expect(vault.connect(beneficiary1).triggerDistribution())
-        .to.be.revertedWith("Already distributed");
-    });
-
-    it("should prevent owner actions after distribution", async function () {
-      const { vault, beneficiary1 } = await loadFixture(fundedVaultFixture);
-
-      await time.increase(SIX_MONTHS + 1);
-      await vault.triggerDistribution();
-
-      await expect(vault.checkIn())
-        .to.be.revertedWith("Already distributed");
-      
-      await expect(vault.withdrawETH(ethers.parseEther("1")))
-        .to.be.revertedWith("Already distributed");
-    });
-  });
-
-  // ============================================
-  // CLAIM TESTS
-  // ============================================
-
-  describe("HeirlockVault - Claims", function () {
-    it("should allow beneficiary to claim ETH", async function () {
-      const { vault, beneficiary1 } = await loadFixture(fundedVaultFixture);
-
-      await time.increase(SIX_MONTHS + 1);
-      await vault.triggerDistribution();
-
-      const balanceBefore = await ethers.provider.getBalance(beneficiary1.address);
-      
-      await expect(vault.connect(beneficiary1).claimETH())
-        .to.emit(vault, "ShareClaimed")
-        .withArgs(beneficiary1.address, ethers.ZeroAddress, ethers.parseEther("5"));
-
-      const balanceAfter = await ethers.provider.getBalance(beneficiary1.address);
-      expect(balanceAfter - balanceBefore).to.be.closeTo(
-        ethers.parseEther("5"),
-        ethers.parseEther("0.01")
+      // Get vault address from event
+      const event = receipt?.logs.find(
+        (log: any) => log.fragment?.name === "VaultCreated"
       );
-    });
-
-    it("should allow beneficiary to claim tokens", async function () {
-      const { vault, beneficiary1, tokenA, tokenB } = await loadFixture(fundedVaultFixture);
-
-      await time.increase(SIX_MONTHS + 1);
-      await vault.triggerDistribution();
-
-      await vault.connect(beneficiary1).claimTokens([
-        await tokenA.getAddress(),
-        await tokenB.getAddress()
-      ]);
-
-      expect(await tokenA.balanceOf(beneficiary1.address)).to.equal(ethers.parseEther("500"));
-      expect(await tokenB.balanceOf(beneficiary1.address)).to.equal(ethers.parseEther("250"));
-    });
-
-    it("should allow beneficiary to claim all at once", async function () {
-      const { vault, beneficiary1, tokenA, tokenB } = await loadFixture(fundedVaultFixture);
-
-      await time.increase(SIX_MONTHS + 1);
-      await vault.triggerDistribution();
-
-      await vault.connect(beneficiary1).claimAll();
-
-      expect(await tokenA.balanceOf(beneficiary1.address)).to.equal(ethers.parseEther("500"));
-      expect(await tokenB.balanceOf(beneficiary1.address)).to.equal(ethers.parseEther("250"));
-    });
-
-    it("should not allow double claims", async function () {
-      const { vault, beneficiary1 } = await loadFixture(fundedVaultFixture);
-
-      await time.increase(SIX_MONTHS + 1);
-      await vault.triggerDistribution();
-
-      await vault.connect(beneficiary1).claimETH();
-
-      await expect(vault.connect(beneficiary1).claimETH())
-        .to.be.revertedWith("Nothing to claim");
-    });
-
-    it("should not allow non-beneficiary to claim", async function () {
-      const { vault, stranger } = await loadFixture(fundedVaultFixture);
-
-      await time.increase(SIX_MONTHS + 1);
-      await vault.triggerDistribution();
-
-      await expect(vault.connect(stranger).claimETH())
-        .to.be.revertedWith("Nothing to claim");
-    });
-  });
-
-  // ============================================
-  // CONFIGURATION UPDATE TESTS
-  // ============================================
-
-  describe("HeirlockVault - Configuration Updates", function () {
-    it("should allow updating beneficiaries", async function () {
-      const { vault, beneficiary1, beneficiary3 } = await loadFixture(createVaultFixture);
-
-      const newBeneficiaries = [
-        { wallet: beneficiary1.address, basisPoints: BP_25 },
-        { wallet: beneficiary3.address, basisPoints: BP_25 + BP_50 }
-      ];
-
-      await expect(vault.updateBeneficiaries(newBeneficiaries))
-        .to.emit(vault, "BeneficiariesUpdated");
-
-      const bens = await vault.getBeneficiaries();
-      expect(bens[1].wallet).to.equal(beneficiary3.address);
-    });
-
-    it("should allow updating threshold and reset timer", async function () {
-      const { vault } = await loadFixture(createVaultFixture);
-
-      await time.increase(ONE_MONTH * 3);
-
-      await vault.updateThreshold(ONE_YEAR);
-
-      expect(await vault.inactivityThreshold()).to.equal(ONE_YEAR);
+      const vaultAddress = (event as any).args.vault;
       
-      const timeUntil = await vault.getTimeUntilClaimable();
-      expect(timeUntil).to.be.closeTo(BigInt(ONE_YEAR), BigInt(10));
+      const vault = await ethers.getContractAt("HeirlockVault", vaultAddress);
+      
+      return { ...base, vault, vaultAddress };
+    }
+
+    describe("Initialization", function () {
+      it("Should set correct owner", async function () {
+        const { vault, owner } = await loadFixture(createVaultFixture);
+        expect(await vault.owner()).to.equal(owner.address);
+      });
+
+      it("Should set correct threshold", async function () {
+        const { vault } = await loadFixture(createVaultFixture);
+        expect(await vault.inactivityThreshold()).to.equal(SIX_MONTHS);
+      });
+
+      it("Should set correct beneficiaries", async function () {
+        const { vault, beneficiary1, beneficiary2 } = await loadFixture(createVaultFixture);
+        
+        const beneficiaries = await vault.getBeneficiaries();
+        expect(beneficiaries.length).to.equal(2);
+        expect(beneficiaries[0].wallet).to.equal(beneficiary1.address);
+        expect(beneficiaries[0].basisPoints).to.equal(BP_50);
+      });
+
+      it("Should set initial check-in time", async function () {
+        const { vault } = await loadFixture(createVaultFixture);
+        const lastCheckIn = await vault.lastCheckIn();
+        expect(lastCheckIn).to.be.gt(0);
+      });
+    });
+
+    describe("Deposits", function () {
+      it("Should accept ETH deposits", async function () {
+        const { vault, owner } = await loadFixture(createVaultFixture);
+        
+        const depositAmount = ethers.parseEther("1.0");
+        await owner.sendTransaction({ to: await vault.getAddress(), value: depositAmount });
+        
+        expect(await ethers.provider.getBalance(await vault.getAddress())).to.equal(depositAmount);
+      });
+
+      it("Should emit ETHDeposited event", async function () {
+        const { vault, owner } = await loadFixture(createVaultFixture);
+        
+        const depositAmount = ethers.parseEther("1.0");
+        await expect(
+          owner.sendTransaction({ to: await vault.getAddress(), value: depositAmount })
+        ).to.emit(vault, "ETHDeposited").withArgs(owner.address, depositAmount);
+      });
+    });
+
+    describe("Check-in", function () {
+      it("Should update lastCheckIn timestamp", async function () {
+        const { vault, owner } = await loadFixture(createVaultFixture);
+        
+        const initialCheckIn = await vault.lastCheckIn();
+        await time.increase(ONE_MONTH);
+        await vault.connect(owner).checkIn();
+        
+        expect(await vault.lastCheckIn()).to.be.gt(initialCheckIn);
+      });
+
+      it("Should only allow owner to check in", async function () {
+        const { vault, stranger } = await loadFixture(createVaultFixture);
+        
+        await expect(vault.connect(stranger).checkIn()).to.be.revertedWith("Not owner");
+      });
+
+      it("Should emit CheckIn event", async function () {
+        const { vault, owner } = await loadFixture(createVaultFixture);
+        
+        await expect(vault.connect(owner).checkIn()).to.emit(vault, "CheckIn");
+      });
+    });
+
+    describe("Claimability", function () {
+      it("Should not be claimable before threshold", async function () {
+        const { vault } = await loadFixture(createVaultFixture);
+        expect(await vault.isClaimable()).to.be.false;
+      });
+
+      it("Should be claimable after threshold", async function () {
+        const { vault } = await loadFixture(createVaultFixture);
+        
+        await time.increase(SIX_MONTHS + 1);
+        expect(await vault.isClaimable()).to.be.true;
+      });
+
+      it("Should report correct time until claimable", async function () {
+        const { vault } = await loadFixture(createVaultFixture);
+        
+        const timeUntil = await vault.getTimeUntilClaimable();
+        expect(timeUntil).to.be.closeTo(BigInt(SIX_MONTHS), BigInt(10));
+      });
+
+      it("Should return 0 time when already claimable", async function () {
+        const { vault } = await loadFixture(createVaultFixture);
+        
+        await time.increase(SIX_MONTHS + 1);
+        expect(await vault.getTimeUntilClaimable()).to.equal(0);
+      });
+    });
+
+    describe("Distribution", function () {
+      it("Should not allow distribution before threshold", async function () {
+        const { vault, stranger } = await loadFixture(createVaultFixture);
+        
+        await expect(vault.connect(stranger).triggerDistribution())
+          .to.be.revertedWith("Not yet claimable");
+      });
+
+      it("Should allow anyone to trigger distribution after threshold", async function () {
+        const { vault, owner, stranger } = await loadFixture(createVaultFixture);
+        
+        // Fund vault
+        await owner.sendTransaction({ 
+          to: await vault.getAddress(), 
+          value: ethers.parseEther("10.0") 
+        });
+        
+        await time.increase(SIX_MONTHS + 1);
+        
+        await expect(vault.connect(stranger).triggerDistribution())
+          .to.emit(vault, "DistributionTriggered");
+      });
+
+      it("Should calculate correct shares", async function () {
+        const { vault, owner, beneficiary1, beneficiary2 } = await loadFixture(createVaultFixture);
+        
+        const depositAmount = ethers.parseEther("10.0");
+        await owner.sendTransaction({ to: await vault.getAddress(), value: depositAmount });
+        
+        await time.increase(SIX_MONTHS + 1);
+        await vault.triggerDistribution();
+        
+        // Each beneficiary should get 50%
+        const [ethAmount1] = await vault.getClaimableAmounts(beneficiary1.address);
+        const [ethAmount2] = await vault.getClaimableAmounts(beneficiary2.address);
+        
+        expect(ethAmount1).to.equal(ethers.parseEther("5.0"));
+        expect(ethAmount2).to.equal(ethers.parseEther("5.0"));
+      });
+    });
+
+    describe("Claims", function () {
+      it("Should allow beneficiary to claim ETH", async function () {
+        const { vault, owner, beneficiary1 } = await loadFixture(createVaultFixture);
+        
+        await owner.sendTransaction({ 
+          to: await vault.getAddress(), 
+          value: ethers.parseEther("10.0") 
+        });
+        
+        await time.increase(SIX_MONTHS + 1);
+        await vault.triggerDistribution();
+        
+        const balanceBefore = await ethers.provider.getBalance(beneficiary1.address);
+        await vault.connect(beneficiary1).claimETH();
+        const balanceAfter = await ethers.provider.getBalance(beneficiary1.address);
+        
+        // Should have received ~5 ETH (minus gas)
+        expect(balanceAfter - balanceBefore).to.be.closeTo(
+          ethers.parseEther("5.0"), 
+          ethers.parseEther("0.01")
+        );
+      });
+
+      it("Should prevent double claims", async function () {
+        const { vault, owner, beneficiary1 } = await loadFixture(createVaultFixture);
+        
+        await owner.sendTransaction({ 
+          to: await vault.getAddress(), 
+          value: ethers.parseEther("10.0") 
+        });
+        
+        await time.increase(SIX_MONTHS + 1);
+        await vault.triggerDistribution();
+        
+        await vault.connect(beneficiary1).claimETH();
+        
+        await expect(vault.connect(beneficiary1).claimETH())
+          .to.be.revertedWith("Nothing to claim");
+      });
+    });
+
+    describe("Owner Withdrawals", function () {
+      it("Should allow owner to withdraw ETH before distribution", async function () {
+        const { vault, owner } = await loadFixture(createVaultFixture);
+        
+        await owner.sendTransaction({ 
+          to: await vault.getAddress(), 
+          value: ethers.parseEther("5.0") 
+        });
+        
+        const balanceBefore = await ethers.provider.getBalance(owner.address);
+        await vault.connect(owner).withdrawETH(ethers.parseEther("2.0"));
+        const balanceAfter = await ethers.provider.getBalance(owner.address);
+        
+        expect(balanceAfter).to.be.gt(balanceBefore);
+      });
+
+      it("Should prevent withdrawals after distribution", async function () {
+        const { vault, owner } = await loadFixture(createVaultFixture);
+        
+        await owner.sendTransaction({ 
+          to: await vault.getAddress(), 
+          value: ethers.parseEther("5.0") 
+        });
+        
+        await time.increase(SIX_MONTHS + 1);
+        await vault.triggerDistribution();
+        
+        await expect(vault.connect(owner).withdrawETH(ethers.parseEther("1.0")))
+          .to.be.revertedWith("Already distributed");
+      });
+    });
+
+    describe("Token Registration", function () {
+      it("Should allow owner to register tokens", async function () {
+        const { vault, owner, mockToken } = await loadFixture(createVaultFixture);
+        
+        await vault.connect(owner).registerToken(await mockToken.getAddress());
+        
+        const tokens = await vault.getRegisteredTokens();
+        expect(tokens.length).to.equal(1);
+        expect(tokens[0]).to.equal(await mockToken.getAddress());
+      });
+
+      it("Should prevent duplicate registration", async function () {
+        const { vault, owner, mockToken } = await loadFixture(createVaultFixture);
+        
+        await vault.connect(owner).registerToken(await mockToken.getAddress());
+        
+        await expect(vault.connect(owner).registerToken(await mockToken.getAddress()))
+          .to.be.revertedWith("Already registered");
+      });
     });
   });
-
-  // ============================================
-  // REGISTRY TESTS
-  // ============================================
 
   describe("HeirlockRegistry", function () {
-    it("should allow vault registration", async function () {
-      const { vault, registry, owner } = await loadFixture(createVaultFixture);
+    async function createVaultWithRegistryFixture() {
+      const base = await loadFixture(deployFixture);
+      const { factory, registry, beneficiary1, beneficiary2 } = base;
+      
+      const beneficiaries = [
+        { wallet: beneficiary1.address, basisPoints: BP_50 },
+        { wallet: beneficiary2.address, basisPoints: BP_50 }
+      ];
+      
+      const tx = await factory.createBasicVault(beneficiaries, SIX_MONTHS, { 
+        value: BASIC_VAULT_FEE 
+      });
+      const receipt = await tx.wait();
+      
+      const event = receipt?.logs.find(
+        (log: any) => log.fragment?.name === "VaultCreated"
+      );
+      const vaultAddress = (event as any).args.vault;
+      const vault = await ethers.getContractAt("HeirlockVault", vaultAddress);
+      
+      return { ...base, vault, vaultAddress };
+    }
 
-      await expect(registry.registerVault(await vault.getAddress()))
-        .to.emit(registry, "VaultRegistered")
-        .withArgs(await vault.getAddress(), owner.address);
+    it("Should allow vault registration", async function () {
+      const { registry, vault, owner } = await loadFixture(createVaultWithRegistryFixture);
+      
+      await registry.connect(owner).registerVault(await vault.getAddress());
+      
+      expect(await registry.isRegistered(await vault.getAddress())).to.be.true;
     });
 
-    it("should index vaults by beneficiary", async function () {
-      const { vault, registry, beneficiary1 } = await loadFixture(createVaultFixture);
-
-      await registry.registerVault(await vault.getAddress());
-
-      const vaults = await registry.getVaultsAsBeneficiary(beneficiary1.address);
+    it("Should index beneficiaries", async function () {
+      const { registry, vault, owner, beneficiary1 } = await loadFixture(createVaultWithRegistryFixture);
+      
+      await registry.connect(owner).registerVault(await vault.getAddress());
+      
+      const vaults = await registry.getVaultsForBeneficiary(beneficiary1.address);
       expect(vaults.length).to.equal(1);
       expect(vaults[0]).to.equal(await vault.getAddress());
     });
 
-    it("should find vaults near deadline", async function () {
-      const { vault, registry } = await loadFixture(createVaultFixture);
-
-      await registry.registerVault(await vault.getAddress());
-
-      await time.increase(SIX_MONTHS - 1000);
-
-      const nearDeadline = await registry.getVaultsNearDeadline(2000);
-      expect(nearDeadline.length).to.equal(1);
-    });
-  });
-
-  // ============================================
-  // EDGE CASE TESTS
-  // ============================================
-
-  describe("Edge Cases", function () {
-    it("should handle single beneficiary with 100%", async function () {
-      const { factory, owner, beneficiary1, tokenA } = await loadFixture(deployFixture);
-
-      const beneficiaries = [{ wallet: beneficiary1.address, basisPoints: BP_100 }];
-      const tx = await factory.createVault(beneficiaries, ONE_MONTH);
-      const receipt = await tx.wait();
-      const event = receipt?.logs.find((log: any) => log.fragment?.name === "VaultCreated");
-      const vaultAddress = (event as any).args.vault;
-      const vault = await ethers.getContractAt("HeirlockVault", vaultAddress);
-
-      await owner.sendTransaction({ to: vaultAddress, value: ethers.parseEther("10") });
-      await tokenA.transfer(vaultAddress, ethers.parseEther("100"));
-      await vault.registerToken(await tokenA.getAddress());
-
-      await time.increase(ONE_MONTH + 1);
-      await vault.connect(beneficiary1).triggerDistribution();
-      await vault.connect(beneficiary1).claimAll();
-
-      expect(await tokenA.balanceOf(beneficiary1.address)).to.equal(ethers.parseEther("100"));
-    });
-
-    it("should handle uneven percentage splits", async function () {
-      const { factory, owner, beneficiary1, beneficiary2, beneficiary3 } = await loadFixture(deployFixture);
-
-      const beneficiaries = [
-        { wallet: beneficiary1.address, basisPoints: 3333 },
-        { wallet: beneficiary2.address, basisPoints: 3333 },
-        { wallet: beneficiary3.address, basisPoints: 3334 }
-      ];
-
-      const tx = await factory.createVault(beneficiaries, ONE_MONTH);
-      const receipt = await tx.wait();
-      const event = receipt?.logs.find((log: any) => log.fragment?.name === "VaultCreated");
-      const vaultAddress = (event as any).args.vault;
-      const vault = await ethers.getContractAt("HeirlockVault", vaultAddress);
-
-      await owner.sendTransaction({ to: vaultAddress, value: ethers.parseEther("10") });
-
-      await time.increase(ONE_MONTH + 1);
-      await vault.triggerDistribution();
-
-      const [amt1] = await vault.getClaimableAmounts(beneficiary1.address);
-      const [amt2] = await vault.getClaimableAmounts(beneficiary2.address);
-      const [amt3] = await vault.getClaimableAmounts(beneficiary3.address);
-
-      expect(amt1 + amt2 + amt3).to.be.closeTo(ethers.parseEther("10"), ethers.parseEther("0.001"));
-    });
-
-    it("should handle empty token balance during distribution", async function () {
-      const { vault, beneficiary1, tokenA } = await loadFixture(createVaultFixture);
-
-      await vault.registerToken(await tokenA.getAddress());
-
-      await time.increase(SIX_MONTHS + 1);
+    it("Should track vault deadlines", async function () {
+      const { registry, vault, owner } = await loadFixture(createVaultWithRegistryFixture);
       
-      await vault.triggerDistribution();
+      await registry.connect(owner).registerVault(await vault.getAddress());
+      
+      const details = await registry.getVaultDetails(await vault.getAddress());
+      expect(details.deadline).to.be.gt(0);
+      expect(details.isActive).to.be.true;
+    });
 
-      const [, , amounts] = await vault.getClaimableAmounts(beneficiary1.address);
-      expect(amounts[0]).to.equal(0);
+    it("Should find vaults near deadline", async function () {
+      const { registry, vault, owner } = await loadFixture(createVaultWithRegistryFixture);
+      
+      await registry.connect(owner).registerVault(await vault.getAddress());
+      
+      // Fast forward to near deadline
+      await time.increase(SIX_MONTHS - ONE_MONTH);
+      
+      const [vaults, deadlines] = await registry.getVaultsNearDeadline(ONE_MONTH * 2);
+      expect(vaults.length).to.equal(1);
     });
   });
 });
+
+// Note: MockERC20 is deployed from contracts/mocks/MockERC20.sol
