@@ -28,16 +28,32 @@ interface IHeirlockVault {
     event DistributionTriggered(address indexed triggeredBy, uint256 timestamp);
     event ShareClaimed(address indexed beneficiary, address indexed token, uint256 amount);
     
-    // ============ Functions ============
+    // ============ Core Functions ============
     
-    /// @notice Confirm owner is still active, resets inactivity timer
+    /// @notice Check in to reset inactivity timer
     function checkIn() external;
     
-    /// @notice Check if vault can be claimed (owner inactive past threshold)
-    /// @return True if claimable
+    /// @notice Check if vault is claimable by beneficiaries
     function isClaimable() external view returns (bool);
     
     /// @notice Get seconds until vault becomes claimable
-    /// @return Seconds remaining, 0 if already claimable
     function getTimeUntilClaimable() external view returns (uint256);
+    
+    /// @notice Get the check-in deadline timestamp
+    function getCheckInDeadline() external view returns (uint256);
+    
+    /// @notice Get all beneficiaries
+    function getBeneficiaries() external view returns (Beneficiary[] memory);
+    
+    /// @notice Get vault owner
+    function owner() external view returns (address);
+    
+    /// @notice Get last check-in timestamp
+    function lastCheckIn() external view returns (uint256);
+    
+    /// @notice Get inactivity threshold in seconds
+    function inactivityThreshold() external view returns (uint256);
+    
+    /// @notice Check if distribution has been triggered
+    function distributed() external view returns (bool);
 }
